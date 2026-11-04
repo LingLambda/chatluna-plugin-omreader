@@ -54,7 +54,7 @@ WASM 转换是同步计算，插件把它放在独立的 worker 线程里执行�
 | `maxBytes` | `51200` | 每次返回给模型的正文字节上限（UTF-8）。 |
 | `maxLines` | `300` | 每次返回给模型的正文行数上限。 |
 | `allowedHosts` | `[]` | 留空不限制；填写后只允许这些域名及其子域名，重定向目标和站点接口请求同样受限。 |
-| `readers` | `[]` | 远程阅读服务回退链：Jina Reader（Key 可选）、Firecrawl（支持自建地址）、Parallel Extract。按顺序尝试，单个服务最多 10 秒。 |
+| `readers` | `[]` | 远程阅读服务回退链：Jina Reader（Key 可选）、Firecrawl（支持自建地址）、Parallel Extract、DeepSeek Fetch（与 DeepSeek API 共用 Key，按成功请求计费）。本地转换得不到正文时按顺序尝试，单个服务最多 30 秒，且不超过 `timeout` 的剩余时间。 |
 | `githubToken` | — | 可选。提高 GitHub API 速率限制，读取 Actions 日志需要它。 |
 
 ```yaml

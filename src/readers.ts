@@ -149,5 +149,39 @@ const parallel = defineReader({
   }
 })
 
+const deepseek = defineReader({
+  id: 'deepseek',
+  label: 'DeepSeek Fetch',
+  fields: Schema.object({
+    apiKey: Schema.string()
+      .role('secret')
+      .required()
+      .label('API Key')
+      .description('在 https://platform.deepseek.com/api_keys 获取。')
+  }),
+  async read(ctx, config, url, signal) {
+    const response = await ctx.http('https://api.deepseek.com/v1/tools/fetch', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },
+      data: JSON.stringify({ url }),
+      signal
+    })
+    // 404: the service could not extract a Markdown body (unreachable, blocked, unsupported type, empty page).
+    if (response.status === 404) {
+      void response.body?.cancel().catch(() => {})
+      return null
+    }
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { error?: { message?: string } } | null
+      throw new Error(`DeepSeek HTTP ${response.status}: ${payload?.error?.message ?? response.statusText}`)
+    }
+    const page = (await response.json()) as { title?: string; content?: string }
+    const content = page.content?.trim()
+    if (!content) return null
+    const title = page.title?.trim()
+    return title && !content.startsWith('#') ? `# ${title}\n\n${content}` : content
+  }
+})
+
 /** Order here is only the order of the type picker in the config UI. */
-export const readers: readonly Reader[] = [jina, firecrawl, parallel]
+export const readers: readonly Reader[] = [jina, firecrawl, parallel, deepseek]

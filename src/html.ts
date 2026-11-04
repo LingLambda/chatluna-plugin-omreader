@@ -221,7 +221,7 @@ export interface HtmlRendering {
 }
 
 /** Per remote reader request, so one stalled endpoint cannot consume the whole budget. */
-const REMOTE_READER_MAX_MS = 10_000
+const REMOTE_READER_MAX_MS = 30_000
 
 export async function renderHtml(page: LoadedPage, env: HtmlEnv, notes: string[]): Promise<HtmlRendering> {
   const { signal, loadPage, ctx } = env
@@ -329,7 +329,8 @@ export async function renderHtml(page: LoadedPage, env: HtmlEnv, notes: string[]
   // Reader chain: the local converter first, then configured remote readers while its output is unusable.
   let rendered = markdown
   let method = 'markdown'
-  const acceptable = (content: string) => content.trim().length > MIN_RENDERED_CHARS && !lowQuality(content)
+  // Front matter alone (title, meta tags) is no rendering: a JS app shell would otherwise pass.
+  const acceptable = (content: string) => withoutMetadata(content).length > MIN_RENDERED_CHARS && !lowQuality(content)
   if (!acceptable(rendered)) {
     for (const [index, entry] of env.readers.entries()) {
       if (!entry.enabled) continue
@@ -346,9 +347,15 @@ export async function renderHtml(page: LoadedPage, env: HtmlEnv, notes: string[]
           page.finalUrl,
           AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
         )
-        if (content === null) continue
+        if (content === null) {
+          notes.push(`${reader.label} returned no content`)
+          continue
+        }
         const cleaned = stripDataUriImages(content).trim()
-        if (!acceptable(cleaned)) continue
+        if (!acceptable(cleaned)) {
+          notes.push(`${reader.label} returned no readable body`)
+          continue
+        }
         rendered = cleaned
         method = label
         notes.push(`Used remote reader: ${reader.label}`)
