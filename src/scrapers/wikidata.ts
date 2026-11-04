@@ -1,0 +1,312 @@
+import type { ScrapeContext, Scraper } from './types'
+import { formatNumber, tryParseJson } from './utils'
+
+/** Common Wikidata property IDs mapped to human-readable names. */
+const PROPERTY_LABELS: Record<string, string> = {
+  P31: 'Instance of',
+  P279: 'Subclass of',
+  P17: 'Country',
+  P131: 'Located in',
+  P625: 'Coordinates',
+  P18: 'Image',
+  P154: 'Logo',
+  P571: 'Founded',
+  P576: 'Dissolved',
+  P169: 'CEO',
+  P112: 'Founded by',
+  P159: 'Headquarters',
+  P452: 'Industry',
+  P1128: 'Employees',
+  P2139: 'Revenue',
+  P856: 'Website',
+  P21: 'Sex/Gender',
+  P27: 'Citizenship',
+  P569: 'Born',
+  P570: 'Died',
+  P19: 'Birthplace',
+  P20: 'Death place',
+  P106: 'Occupation',
+  P108: 'Employer',
+  P69: 'Educated at',
+  P22: 'Father',
+  P25: 'Mother',
+  P26: 'Spouse',
+  P40: 'Child',
+  P166: 'Award',
+  P136: 'Genre',
+  P495: 'Country of origin',
+  P577: 'Publication date',
+  P50: 'Author',
+  P123: 'Publisher',
+  P364: 'Original language',
+  P86: 'Composer',
+  P57: 'Director',
+  P161: 'Cast member',
+  P170: 'Creator',
+  P178: 'Developer',
+  P275: 'License',
+  P306: 'Operating system',
+  P277: 'Programming language',
+  P348: 'Version',
+  P1566: 'GeoNames ID',
+  P214: 'VIAF ID',
+  P227: 'GND ID',
+  P213: 'ISNI',
+  P496: 'ORCID'
+}
+
+interface WikidataEntity {
+  type: string
+  id: string
+  labels?: Record<string, { language: string; value: string }>
+  descriptions?: Record<string, { language: string; value: string }>
+  aliases?: Record<string, { language: string; value: string }[]>
+  claims?: Record<string, WikidataClaim[]>
+  sitelinks?: Record<string, { site: string; title: string }>
+}
+
+interface WikidataClaim {
+  mainsnak: {
+    snaktype: string
+    property: string
+    datavalue?: {
+      type: string
+      value: WikidataValue
+    }
+  }
+  rank: string
+}
+
+type WikidataValue =
+  | string
+  | { 'entity-type': string; id: string; 'numeric-id': number }
+  | { time: string; precision: number; calendarmodel: string }
+  | { amount: string; unit: string }
+  | { text: string; language: string }
+  | { latitude: number; longitude: number; precision: number }
+
+/** Wikidata items via the EntityData API. */
+export const scrapeWikidata: Scraper = async (ctx) => {
+  try {
+    const parsed = ctx.url
+    if (!parsed.hostname.includes('wikidata.org')) return null
+
+    // Q-id from /wiki/Q123 or /entity/Q123
+    const qidMatch = parsed.pathname.match(/\/(?:wiki|entity)\/(Q\d+)/i)
+    if (!qidMatch) return null
+
+    const qid = qidMatch[1]!.toUpperCase()
+
+    const apiUrl = `https://www.wikidata.org/wiki/Special:EntityData/${qid}.json`
+    const result = await ctx.loadPage(apiUrl)
+
+    if (!result.ok) return null
+
+    const data = tryParseJson<{ entities: Record<string, WikidataEntity> }>(result.content)
+    if (!data) return null
+
+    const entity = data.entities[qid]
+    if (!entity) return null
+
+    // Label and description, preferring English
+    const label = getLocalizedValue(entity.labels, 'en') || qid
+    const description = getLocalizedValue(entity.descriptions, 'en')
+    const aliases = getLocalizedAliases(entity.aliases, 'en')
+
+    let md = `# ${label} (${qid})\n\n`
+    if (description) md += `*${description}*\n\n`
+    if (aliases.length > 0) md += `**Also known as:** ${aliases.join(', ')}\n\n`
+
+    const sitelinkCount = entity.sitelinks ? Object.keys(entity.sitelinks).length : 0
+    if (sitelinkCount > 0) {
+      md += `**Wikipedia articles:** ${formatNumber(sitelinkCount)} languages\n\n`
+    }
+
+    if (entity.claims && Object.keys(entity.claims).length > 0) {
+      md += '## Properties\n\n'
+
+      // Entity IDs whose labels are needed
+      const entityIdsToResolve = new Set<string>()
+      for (const claims of Object.values(entity.claims)) {
+        for (const claim of claims) {
+          if (claim.mainsnak.datavalue?.type === 'wikibase-entityid') {
+            const val = claim.mainsnak.datavalue.value as { id: string }
+            entityIdsToResolve.add(val.id)
+          }
+        }
+      }
+
+      // Labels for referenced entities (first 50)
+      const entityLabels = await resolveEntityLabels(ctx, Array.from(entityIdsToResolve).slice(0, 50))
+
+      const processedProperties: string[] = []
+      for (const [propId, claims] of Object.entries(entity.claims)) {
+        const propLabel = PROPERTY_LABELS[propId] || propId
+        const values: string[] = []
+
+        for (const claim of claims) {
+          if (claim.rank === 'deprecated') continue
+          const value = formatClaimValue(claim, entityLabels)
+          if (value && !values.includes(value)) {
+            values.push(value)
+          }
+        }
+
+        if (values.length > 0) {
+          const displayValues = values.slice(0, 10)
+          const overflow = values.length > 10 ? ` […${values.length - 10} values elided…]` : ''
+          processedProperties.push(`- **${propLabel}:** ${displayValues.join(', ')}${overflow}`)
+        }
+      }
+
+      // Known properties first, then by text
+      processedProperties.sort((a, b) => {
+        const aKnown = Object.values(PROPERTY_LABELS).some((l) => a.includes(`**${l}:**`))
+        const bKnown = Object.values(PROPERTY_LABELS).some((l) => b.includes(`**${l}:**`))
+        if (aKnown && !bKnown) return -1
+        if (!aKnown && bKnown) return 1
+        return a.localeCompare(b)
+      })
+
+      const maxProps = 50
+      md += processedProperties.slice(0, maxProps).join('\n')
+      if (processedProperties.length > maxProps) {
+        md += `\n\n[…${processedProperties.length - maxProps} properties elided…]`
+      }
+      md += '\n'
+    }
+
+    // Notable sitelinks
+    if (entity.sitelinks) {
+      const notableSites = ['enwiki', 'dewiki', 'frwiki', 'eswiki', 'jawiki', 'zhwiki']
+      const links: string[] = []
+
+      for (const site of notableSites) {
+        const sitelink = entity.sitelinks[site]
+        if (sitelink) {
+          const lang = site.replace('wiki', '')
+          const wikiUrl = `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(sitelink.title)}`
+          links.push(`[${lang.toUpperCase()}](${wikiUrl})`)
+        }
+      }
+
+      if (links.length > 0) {
+        md += `\n## Wikipedia Links\n\n${links.join(' · ')}\n`
+      }
+    }
+
+    return { content: md, method: 'wikidata', notes: ['Fetched via Wikidata EntityData API'] }
+  } catch {
+    // Fall through to the generic path.
+  }
+
+  return null
+}
+
+function getLocalizedValue(
+  values: Record<string, { language: string; value: string }> | undefined,
+  preferredLang: string
+): string | null {
+  if (!values) return null
+  if (values[preferredLang]) return values[preferredLang].value
+  // Any available language
+  const first = Object.values(values)[0]
+  return first?.value || null
+}
+
+function getLocalizedAliases(
+  aliases: Record<string, { language: string; value: string }[]> | undefined,
+  preferredLang: string
+): string[] {
+  if (!aliases) return []
+  const langAliases = aliases[preferredLang]
+  if (!langAliases) return []
+  return langAliases.map((a) => a.value)
+}
+
+/** Entity IDs → English labels via wbgetentities. */
+async function resolveEntityLabels(ctx: ScrapeContext, entityIds: string[]): Promise<Record<string, string>> {
+  if (entityIds.length === 0) return {}
+
+  const labels: Record<string, string> = {}
+
+  const batchSize = 50
+  for (let i = 0; i < entityIds.length; i += batchSize) {
+    const batch = entityIds.slice(i, i + batchSize)
+    const apiUrl = `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${batch.join('|')}&props=labels&languages=en&format=json`
+
+    try {
+      const result = await ctx.loadPage(apiUrl, { timeoutMs: 10_000 })
+      if (result.ok) {
+        const data = JSON.parse(result.content) as {
+          entities: Record<string, { labels?: Record<string, { value: string }> }>
+        }
+        for (const [id, entity] of Object.entries(data.entities)) {
+          const label = entity.labels?.en?.value
+          if (label) labels[id] = label
+        }
+      }
+    } catch {
+      // Unresolved IDs print as-is.
+    }
+  }
+
+  return labels
+}
+
+function formatClaimValue(claim: WikidataClaim, entityLabels: Record<string, string>): string | null {
+  const snak = claim.mainsnak
+  if (snak.snaktype !== 'value' || !snak.datavalue) return null
+
+  const { type, value } = snak.datavalue
+
+  switch (type) {
+    case 'wikibase-entityid': {
+      const entityVal = value as { id: string }
+      return entityLabels[entityVal.id] || entityVal.id
+    }
+    case 'string':
+      return value as string
+    case 'time': {
+      const timeVal = value as { time: string; precision: number }
+      return formatWikidataTime(timeVal.time, timeVal.precision)
+    }
+    case 'quantity': {
+      const qtyVal = value as { amount: string; unit: string }
+      const amount = qtyVal.amount.replace(/^\+/, '')
+      // Unit Q-id, if any
+      const unitMatch = qtyVal.unit.match(/Q\d+$/)
+      const unit = unitMatch ? entityLabels[unitMatch[0]] || '' : ''
+      return unit ? `${amount} ${unit}` : amount
+    }
+    case 'monolingualtext': {
+      const textVal = value as { text: string; language: string }
+      return textVal.text
+    }
+    case 'globecoordinate': {
+      const coordVal = value as { latitude: number; longitude: number }
+      return `${coordVal.latitude.toFixed(4)}, ${coordVal.longitude.toFixed(4)}`
+    }
+    default:
+      return null
+  }
+}
+
+/** `+YYYY-MM-DDT00:00:00Z` at precision 9 (year), 10 (month) or 11 (day). */
+function formatWikidataTime(time: string, precision: number): string {
+  const match = time.match(/^([+-]?\d+)-(\d{2})-(\d{2})/)
+  if (!match) return time
+
+  const [, year, month, day] = match
+  const yearNum = Number.parseInt(year!, 10)
+  const absYear = Math.abs(yearNum)
+  const era = yearNum < 0 ? ' BCE' : ''
+
+  if (precision >= 11) {
+    return `${day}/${month}/${absYear}${era}`
+  }
+  if (precision >= 10) {
+    return `${month}/${absYear}${era}`
+  }
+  return `${absYear}${era}`
+}

@@ -1,0 +1,131 @@
+// Vulnerabilities via the OSV API.
+import type { Scraper } from './types'
+import { formatIsoDate, tryParseJson } from './utils'
+
+interface OsvSeverity {
+  type: string
+  score: string
+}
+
+interface OsvAffectedRange {
+  type: string
+  events?: { introduced?: string; fixed?: string; last_affected?: string; limit?: string }[]
+}
+
+interface OsvAffected {
+  package?: {
+    ecosystem: string
+    name: string
+    purl?: string
+  }
+  ranges?: OsvAffectedRange[]
+  versions?: string[]
+  severity?: OsvSeverity[]
+  database_specific?: Record<string, unknown>
+  ecosystem_specific?: Record<string, unknown>
+}
+
+interface OsvReference {
+  type: string
+  url: string
+}
+
+interface OsvVulnerability {
+  id: string
+  summary?: string
+  details?: string
+  aliases?: string[]
+  modified?: string
+  published?: string
+  withdrawn?: string
+  severity?: OsvSeverity[]
+  affected?: OsvAffected[]
+  references?: OsvReference[]
+  credits?: { name: string; contact?: string[]; type?: string }[]
+  database_specific?: Record<string, unknown>
+}
+
+export const scrapeOsv: Scraper = async (ctx) => {
+  try {
+    const parsed = ctx.url
+    if (parsed.hostname !== 'osv.dev') return null
+
+    // ID from /vulnerability/{id}
+    const match = parsed.pathname.match(/^\/vulnerability\/([A-Za-z0-9-]+)$/)
+    if (!match) return null
+
+    const result = await ctx.loadPage(`https://api.osv.dev/v1/vulns/${match[1]}`, {
+      headers: { Accept: 'application/json' }
+    })
+    if (!result.ok) return null
+
+    const vuln = tryParseJson<OsvVulnerability>(result.content)
+    if (!vuln) return null
+
+    let md = `# ${vuln.id}\n\n`
+
+    if (vuln.summary) md += `${vuln.summary}\n\n`
+
+    md += '## Metadata\n\n'
+    if (vuln.aliases?.length) md += `**Aliases:** ${vuln.aliases.join(', ')}\n`
+    if (vuln.published) md += `**Published:** ${formatIsoDate(vuln.published)}\n`
+    if (vuln.modified) md += `**Modified:** ${formatIsoDate(vuln.modified)}\n`
+    if (vuln.withdrawn) md += `**Withdrawn:** ${formatIsoDate(vuln.withdrawn)}\n`
+
+    const severities = vuln.severity || vuln.affected?.flatMap((a) => a.severity || []) || []
+    if (severities.length) md += `**Severity:** ${severities.map((s) => `${s.type}: ${s.score}`).join(', ')}\n`
+    md += '\n'
+
+    if (vuln.details) md += `## Details\n\n${vuln.details}\n\n`
+
+    if (vuln.affected?.length) {
+      md += '## Affected Packages\n\n'
+      for (const affected of vuln.affected) {
+        const pkg = affected.package
+        if (!pkg) continue
+
+        md += `### ${pkg.ecosystem}: ${pkg.name}\n\n`
+
+        for (const range of affected.ranges ?? []) {
+          if (!range.events?.length) continue
+          const parts: string[] = []
+          for (const event of range.events) {
+            if (event.introduced) parts.push(`introduced: ${event.introduced}`)
+            if (event.fixed) parts.push(`fixed: ${event.fixed}`)
+            if (event.last_affected) parts.push(`last_affected: ${event.last_affected}`)
+            if (event.limit) parts.push(`limit: ${event.limit}`)
+          }
+          if (parts.length) md += `- **${range.type}:** ${parts.join(' → ')}\n`
+        }
+
+        if (affected.versions?.length) {
+          const versions =
+            affected.versions.length > 10
+              ? `${affected.versions.slice(0, 10).join(', ')}… (${affected.versions.length} total)`
+              : affected.versions.join(', ')
+          md += `- **Versions:** ${versions}\n`
+        }
+
+        md += '\n'
+      }
+    }
+
+    if (vuln.references?.length) {
+      md += '## References\n\n'
+      for (const ref of vuln.references) md += `- [${ref.type}](${ref.url})\n`
+      md += '\n'
+    }
+
+    if (vuln.credits?.length) {
+      md += '## Credits\n\n'
+      for (const credit of vuln.credits) {
+        const type = credit.type ? ` (${credit.type})` : ''
+        md += `- ${credit.name}${type}\n`
+      }
+    }
+
+    return { content: md, method: 'osv', notes: ['Fetched via OSV API'] }
+  } catch {}
+
+  return null
+}

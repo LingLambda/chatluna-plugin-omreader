@@ -1,0 +1,81 @@
+{
+    "name": "chatluna-plugin-omreader",
+    "version": "0.1.0",
+    "description": "chatluna的 URL 内容读取插件：网页、站点接口、PDF/Office 文档、图片等统一转换为模型可读的内容。",
+    "type": "module",
+    "license": "MIT",
+    "author": "LingLambda",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/LingLambda/chatluna-plugin-omreader.git"
+    },
+    "homepage": "https://github.com/LingLambda/chatluna-plugin-omreader#readme",
+    "bugs": {
+        "url": "https://github.com/LingLambda/chatluna-plugin-omreader/issues"
+    },
+    "keywords": [
+        "chatluna",
+        "chatluna-plugin",
+        "fetch",
+        "web-fetch",
+        "reader",
+        "markdown",
+        "pdf",
+        "document"
+    ],
+    "main": "lib/index.js",
+    "types": "lib/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./lib/index.d.ts",
+            "default": "./lib/index.js"
+        },
+        "./html-worker": {
+            "default": "./lib/html-worker.js"
+        },
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "lib",
+        "README.md",
+        "LICENSE",
+        "NOTICE"
+    ],
+    "engines": {
+        "node": ">=24.0.0"
+    },
+    "scripts": {
+        "build": "yakumo build",
+        "clean": "yakumo clean"
+    },
+    "dependencies": {
+        "@cf-wasm/photon": "^0.4.0",
+        "@xberg-io/html-to-markdown-wasm": "3.12.3",
+        "fflate": "^0.8.3",
+        "linkedom": "0.18.12",
+        "mammoth": "^1.13.0",
+        "unpdf": "^2.1.0"
+    },
+    "peerDependencies": {
+        "@chatluna/schema": "^2.0.0-alpha.0",
+        "@chatluna/tool": "^2.0.0-alpha.0",
+        "@cordisjs/plugin-http": "^1.5.0",
+        "cordis": "^4.0.0-rc.12"
+    },
+    "devDependencies": {
+        "@chatluna/schema": "2.0.0-alpha.0",
+        "@chatluna/tool": "2.0.0-alpha.0",
+        "@cordisjs/plugin-http": "^1.5.1",
+        "cordis": "4.0.0-rc.12",
+        "typescript": "*"
+    },
+    "cordis": {
+        "description": {
+            "zh": "chatluna的 URL 内容读取插件：网页、站点接口、PDF/Office 文档、图片等统一转换为模型可读的内容。",
+            "en": "URL reader for ChatLuna: web pages, site APIs, PDF/Office documents, images and more, turned into content the model can read."
+        }
+    },
+    "chatluna": {
+        "description": "chatluna的 URL 内容读取插件：网页、站点接口、PDF/Office 文档、图片等统一转换为模型可读的内容。"
+    }
+}

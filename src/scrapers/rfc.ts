@@ -1,0 +1,153 @@
+// IETF RFCs as RFC Editor metadata plus cleaned plain text.
+import type { Scraper } from './types'
+import { tryParseJson } from './utils'
+
+interface RfcMetadata {
+  doc_id: string
+  title: string
+  authors?: { name: string; affiliation?: string }[]
+  pub_status?: string
+  current_status?: string
+  stream?: string
+  area?: string
+  wg_acronym?: string
+  pub_date?: string
+  page_count?: number
+  abstract?: string
+  keywords?: string[]
+  obsoletes?: string[]
+  obsoleted_by?: string[]
+  updates?: string[]
+  updated_by?: string[]
+  see_also?: string[]
+  errata_url?: string
+}
+
+const METADATA_TIMEOUT_MS = 10_000
+
+function extractRfcNumber(url: URL): string | null {
+  const { hostname, pathname } = url
+
+  // www.rfc-editor.org/rfc/rfc{number}[.html|.txt|.pdf]
+  if (hostname === 'www.rfc-editor.org' || hostname === 'rfc-editor.org') {
+    const match = pathname.match(/\/rfc\/rfc(\d+)(?:\.(?:html|txt|pdf))?$/i)
+    if (match) return match[1]!
+  }
+
+  // datatracker.ietf.org/doc/rfc{number}/ or datatracker.ietf.org/doc/html/rfc{number}
+  if (hostname === 'datatracker.ietf.org') {
+    const match = pathname.match(/\/doc\/(?:html\/)?rfc(\d+)\/?$/i)
+    if (match) return match[1]!
+  }
+
+  // tools.ietf.org/html/rfc{number}
+  if (hostname === 'tools.ietf.org') {
+    const match = pathname.match(/\/html\/rfc(\d+)$/i)
+    if (match) return match[1]!
+  }
+
+  return null
+}
+
+/** Drops page headers/footers from RFC plain text. */
+function cleanRfcText(text: string): string {
+  const cleaned: string[] = []
+  let skipNext = 0
+
+  for (const line of text.split('\n')) {
+    if (skipNext > 0) {
+      skipNext--
+      continue
+    }
+
+    // A form feed starts a page break; the following header lines go too
+    if (line.includes('\f')) {
+      skipNext = 3
+      continue
+    }
+
+    // Page footers ("[Page N]")
+    if (/^\s*\[Page \d+\]\s*$/.test(line)) continue
+
+    cleaned.push(line)
+  }
+
+  return cleaned.join('\n').replace(/\n{4,}/g, '\n\n\n')
+}
+
+export const scrapeRfc: Scraper = async (ctx) => {
+  try {
+    const rfcNumber = extractRfcNumber(ctx.url)
+    if (!rfcNumber) return null
+
+    const notes: string[] = []
+
+    // Metadata JSON and plain text in parallel
+    const [metaResult, textResult] = await Promise.all([
+      ctx.loadPage(`https://www.rfc-editor.org/rfc/rfc${rfcNumber}.json`, { timeoutMs: METADATA_TIMEOUT_MS }),
+      ctx.loadPage(`https://www.rfc-editor.org/rfc/rfc${rfcNumber}.txt`)
+    ])
+
+    // The text is required
+    if (!textResult.ok) return null
+
+    let metadata: RfcMetadata | null = null
+    if (metaResult.ok) {
+      metadata = tryParseJson<RfcMetadata>(metaResult.content)
+      if (metadata) notes.push('Metadata from RFC Editor JSON API')
+    }
+
+    let md = ''
+
+    if (metadata) {
+      md += `# RFC ${rfcNumber}: ${metadata.title}\n\n`
+
+      if (metadata.authors?.length) {
+        const authorList = metadata.authors
+          .map((a) => (a.affiliation ? `${a.name} (${a.affiliation})` : a.name))
+          .join(', ')
+        md += `**Authors:** ${authorList}\n`
+      }
+
+      if (metadata.pub_date) md += `**Published:** ${metadata.pub_date}\n`
+      if (metadata.current_status) md += `**Status:** ${metadata.current_status}\n`
+      if (metadata.stream) md += `**Stream:** ${metadata.stream}\n`
+      if (metadata.area) md += `**Area:** ${metadata.area}\n`
+      if (metadata.wg_acronym) md += `**Working Group:** ${metadata.wg_acronym}\n`
+      if (metadata.page_count) md += `**Pages:** ${metadata.page_count}\n`
+
+      if (metadata.obsoletes?.length) md += `**Obsoletes:** ${metadata.obsoletes.join(', ')}\n`
+      if (metadata.obsoleted_by?.length) md += `**Obsoleted by:** ${metadata.obsoleted_by.join(', ')}\n`
+      if (metadata.updates?.length) md += `**Updates:** ${metadata.updates.join(', ')}\n`
+      if (metadata.updated_by?.length) md += `**Updated by:** ${metadata.updated_by.join(', ')}\n`
+
+      if (metadata.keywords?.length) md += `**Keywords:** ${metadata.keywords.join(', ')}\n`
+
+      if (metadata.errata_url) md += `**Errata:** ${metadata.errata_url}\n`
+
+      md += '\n'
+
+      if (metadata.abstract) md += `## Abstract\n\n${metadata.abstract}\n\n`
+
+      md += '---\n\n'
+    } else {
+      md += `# RFC ${rfcNumber}\n\n`
+      notes.push('Metadata not available, showing plain text only')
+    }
+
+    md += '## Full Text\n\n'
+    md += '```\n'
+    md += cleanRfcText(textResult.content)
+    md += '\n```\n'
+
+    return {
+      content: md,
+      method: 'rfc',
+      finalUrl: `https://www.rfc-editor.org/rfc/rfc${rfcNumber}`,
+      notes: notes.length ? notes : ['Fetched from RFC Editor'],
+      truncated: textResult.truncated
+    }
+  } catch {}
+
+  return null
+}

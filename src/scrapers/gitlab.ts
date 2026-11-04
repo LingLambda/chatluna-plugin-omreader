@@ -1,0 +1,338 @@
+// gitlab.com repos, files, trees, issues and merge requests via API v4.
+import type { ScrapeContext, Scraper } from './types'
+import { formatIsoDate, formatNumber, tryParseJson } from './utils'
+
+interface GitLabUrl {
+  namespace: string
+  project: string
+  type: 'repo' | 'blob' | 'tree' | 'issue' | 'merge_request'
+  ref?: string
+  path?: string
+  id?: number
+}
+
+/** Parse a gitlab.com URL into structured data. */
+function parseGitLabUrl(parsed: URL): GitLabUrl | null {
+  if (parsed.hostname !== 'gitlab.com') return null
+
+  const segments = parsed.pathname.split('/').filter(Boolean)
+  if (segments.length < 2) return null
+
+  const [namespace, project, ...rest] = segments as [string, string, ...string[]]
+
+  // Repo root
+  if (rest.length === 0) {
+    return { namespace, project, type: 'repo' }
+  }
+
+  // Only `/-/` routes are handled
+  if (rest[0] !== '-') return null
+
+  const [, type, ...remaining] = rest
+
+  // File: gitlab.com/{ns}/{proj}/-/blob/{ref}/{path}
+  if (type === 'blob' && remaining.length >= 2) {
+    const [ref, ...pathParts] = remaining
+    return { namespace, project, type: 'blob', ref, path: pathParts.join('/') }
+  }
+
+  // Directory: gitlab.com/{ns}/{proj}/-/tree/{ref}/{path}
+  if (type === 'tree' && remaining.length >= 1) {
+    const [ref, ...pathParts] = remaining
+    return {
+      namespace,
+      project,
+      type: 'tree',
+      ref,
+      path: pathParts.length > 0 ? pathParts.join('/') : undefined
+    }
+  }
+
+  // Issue: gitlab.com/{ns}/{proj}/-/issues/{id}
+  if (type === 'issues' && remaining.length === 1) {
+    const id = parseInt(remaining[0] ?? '', 10)
+    if (Number.isNaN(id)) return null
+    return { namespace, project, type: 'issue', id }
+  }
+
+  // MR: gitlab.com/{ns}/{proj}/-/merge_requests/{id}
+  if (type === 'merge_requests' && remaining.length === 1) {
+    const id = parseInt(remaining[0] ?? '', 10)
+    if (Number.isNaN(id)) return null
+    return { namespace, project, type: 'merge_request', id }
+  }
+
+  return null
+}
+
+/** Numeric project ID for a namespace/project path. */
+async function getProjectId(ctx: ScrapeContext, gl: GitLabUrl): Promise<number | null> {
+  const encodedPath = encodeURIComponent(`${gl.namespace}/${gl.project}`)
+  const apiUrl = `https://gitlab.com/api/v4/projects/${encodedPath}`
+
+  const result = await ctx.loadPage(apiUrl)
+  if (!result.ok) return null
+
+  const data = tryParseJson<{ id: number }>(result.content)
+  if (!data) return null
+  return data.id
+}
+
+async function renderGitLabRepo(ctx: ScrapeContext, gl: GitLabUrl): Promise<{ content: string; ok: boolean }> {
+  const encodedPath = encodeURIComponent(`${gl.namespace}/${gl.project}`)
+  const apiUrl = `https://gitlab.com/api/v4/projects/${encodedPath}`
+
+  const result = await ctx.loadPage(apiUrl)
+  if (!result.ok) return { content: '', ok: false }
+
+  const repo = tryParseJson<{
+    name: string
+    description?: string
+    star_count: number
+    forks_count: number
+    open_issues_count: number
+    default_branch: string
+    visibility: string
+    created_at: string
+    last_activity_at: string
+    topics?: string[]
+    readme_url?: string
+  }>(result.content)
+  if (!repo) return { content: '', ok: false }
+
+  let md = `# ${repo.name}\n\n`
+  if (repo.description) md += `${repo.description}\n\n`
+  md += `**Stars:** ${formatNumber(repo.star_count)} · **Forks:** ${formatNumber(repo.forks_count)} · **Issues:** ${formatNumber(repo.open_issues_count)}\n`
+  md += `**Visibility:** ${repo.visibility} · **Default Branch:** ${repo.default_branch}\n`
+  if (repo.topics && repo.topics.length > 0) {
+    md += `**Topics:** ${repo.topics.join(', ')}\n`
+  }
+  md += `**Created:** ${formatIsoDate(repo.created_at)} · **Last Activity:** ${formatIsoDate(repo.last_activity_at)}\n\n`
+
+  if (repo.readme_url) {
+    const readmeResult = await ctx.loadPage(repo.readme_url)
+    if (readmeResult.ok && readmeResult.content.trim().length > 0) {
+      md += `---\n\n## README\n\n${readmeResult.content}\n`
+    }
+  }
+
+  return { content: md, ok: true }
+}
+
+async function renderGitLabFile(
+  ctx: ScrapeContext,
+  gl: GitLabUrl,
+  projectId: number
+): Promise<{ content: string; ok: boolean; truncated?: boolean }> {
+  const encodedPath = encodeURIComponent(gl.path ?? '')
+  const apiUrl = `https://gitlab.com/api/v4/projects/${projectId}/repository/files/${encodedPath}/raw?ref=${gl.ref}`
+
+  const result = await ctx.loadPage(apiUrl)
+  if (!result.ok) return { content: '', ok: false }
+
+  return { content: result.content, ok: true, truncated: result.truncated }
+}
+
+async function renderGitLabTree(
+  ctx: ScrapeContext,
+  gl: GitLabUrl,
+  projectId: number
+): Promise<{ content: string; ok: boolean }> {
+  const apiUrl = `https://gitlab.com/api/v4/projects/${projectId}/repository/tree?ref=${gl.ref}&path=${gl.path || ''}&per_page=100`
+
+  const result = await ctx.loadPage(apiUrl)
+  if (!result.ok) return { content: '', ok: false }
+
+  const tree = tryParseJson<
+    {
+      name: string
+      type: 'tree' | 'blob'
+      path: string
+      mode: string
+    }[]
+  >(result.content)
+  if (!tree) return { content: '', ok: false }
+
+  let md = `# Directory: ${gl.path || '/'}\n\n`
+  md += `**Ref:** ${gl.ref}\n\n`
+
+  const dirs = tree.filter((item) => item.type === 'tree')
+  const files = tree.filter((item) => item.type === 'blob')
+
+  if (dirs.length > 0) {
+    md += `## Directories (${dirs.length})\n\n`
+    for (const dir of dirs) {
+      md += `- 📁 ${dir.name}/\n`
+    }
+    md += `\n`
+  }
+
+  if (files.length > 0) {
+    md += `## Files (${files.length})\n\n`
+    for (const file of files) {
+      md += `- 📄 ${file.name}\n`
+    }
+  }
+
+  return { content: md, ok: true }
+}
+
+async function renderGitLabIssue(
+  ctx: ScrapeContext,
+  gl: GitLabUrl,
+  projectId: number
+): Promise<{ content: string; ok: boolean }> {
+  const apiUrl = `https://gitlab.com/api/v4/projects/${projectId}/issues/${gl.id}`
+
+  const result = await ctx.loadPage(apiUrl)
+  if (!result.ok) return { content: '', ok: false }
+
+  const issue = tryParseJson<{
+    title: string
+    description?: string
+    state: string
+    author: { name: string; username: string }
+    created_at: string
+    updated_at: string
+    labels: string[]
+    upvotes: number
+    downvotes: number
+    user_notes_count: number
+    assignees?: { name: string }[]
+  }>(result.content)
+  if (!issue) return { content: '', ok: false }
+
+  let md = `# Issue #${gl.id}: ${issue.title}\n\n`
+  md += `**State:** ${issue.state.toUpperCase()} · **Author:** ${issue.author.name} (@${issue.author.username})\n`
+  md += `**Created:** ${formatIsoDate(issue.created_at)} · **Updated:** ${formatIsoDate(issue.updated_at)}\n`
+  md += `**Upvotes:** ${issue.upvotes} · **Downvotes:** ${issue.downvotes} · **Comments:** ${issue.user_notes_count}\n`
+
+  if (issue.labels.length > 0) {
+    md += `**Labels:** ${issue.labels.join(', ')}\n`
+  }
+
+  if (issue.assignees && issue.assignees.length > 0) {
+    md += `**Assignees:** ${issue.assignees.map((a) => a.name).join(', ')}\n`
+  }
+
+  md += `\n---\n\n## Description\n\n`
+  md += issue.description ? await ctx.htmlToMarkdown(issue.description) : '*No description*'
+
+  return { content: md, ok: true }
+}
+
+async function renderGitLabMR(
+  ctx: ScrapeContext,
+  gl: GitLabUrl,
+  projectId: number
+): Promise<{ content: string; ok: boolean }> {
+  const apiUrl = `https://gitlab.com/api/v4/projects/${projectId}/merge_requests/${gl.id}`
+
+  const result = await ctx.loadPage(apiUrl)
+  if (!result.ok) return { content: '', ok: false }
+
+  const mr = tryParseJson<{
+    title: string
+    description?: string
+    state: string
+    author: { name: string; username: string }
+    created_at: string
+    updated_at: string
+    source_branch: string
+    target_branch: string
+    labels: string[]
+    upvotes: number
+    downvotes: number
+    user_notes_count: number
+    assignees?: { name: string }[]
+    draft: boolean
+    merge_status: string
+  }>(result.content)
+  if (!mr) return { content: '', ok: false }
+
+  let md = `# MR !${gl.id}: ${mr.title}\n\n`
+  if (mr.draft) md += `**[DRAFT]** `
+  md += `**State:** ${mr.state.toUpperCase()} · **Author:** ${mr.author.name} (@${mr.author.username})\n`
+  md += `**Branch:** ${mr.source_branch} → ${mr.target_branch}\n`
+  md += `**Created:** ${formatIsoDate(mr.created_at)} · **Updated:** ${formatIsoDate(mr.updated_at)}\n`
+  md += `**Merge Status:** ${mr.merge_status} · **Upvotes:** ${mr.upvotes} · **Downvotes:** ${mr.downvotes} · **Comments:** ${mr.user_notes_count}\n`
+
+  if (mr.labels.length > 0) {
+    md += `**Labels:** ${mr.labels.join(', ')}\n`
+  }
+
+  if (mr.assignees && mr.assignees.length > 0) {
+    md += `**Assignees:** ${mr.assignees.map((a) => a.name).join(', ')}\n`
+  }
+
+  md += `\n---\n\n## Description\n\n`
+  md += mr.description ? await ctx.htmlToMarkdown(mr.description) : '*No description*'
+
+  return { content: md, ok: true }
+}
+
+export const scrapeGitLab: Scraper = async (ctx) => {
+  const gl = parseGitLabUrl(ctx.url)
+  if (!gl) return null
+
+  const notes: string[] = []
+
+  switch (gl.type) {
+    case 'blob': {
+      const projectId = await getProjectId(ctx, gl)
+      if (!projectId) break
+
+      notes.push(`Fetched raw file via GitLab API`)
+      const result = await renderGitLabFile(ctx, gl, projectId)
+      if (result.ok) {
+        return {
+          content: result.content,
+          method: 'gitlab-raw',
+          notes,
+          contentType: 'text/plain',
+          truncated: result.truncated
+        }
+      }
+      break
+    }
+
+    case 'tree': {
+      const projectId = await getProjectId(ctx, gl)
+      if (!projectId) break
+
+      notes.push(`Fetched directory tree via GitLab API`)
+      const result = await renderGitLabTree(ctx, gl, projectId)
+      if (result.ok) return { content: result.content, method: 'gitlab-tree', notes }
+      break
+    }
+
+    case 'issue': {
+      const projectId = await getProjectId(ctx, gl)
+      if (!projectId) break
+
+      notes.push(`Fetched issue via GitLab API`)
+      const result = await renderGitLabIssue(ctx, gl, projectId)
+      if (result.ok) return { content: result.content, method: 'gitlab-issue', notes }
+      break
+    }
+
+    case 'merge_request': {
+      const projectId = await getProjectId(ctx, gl)
+      if (!projectId) break
+
+      notes.push(`Fetched merge request via GitLab API`)
+      const result = await renderGitLabMR(ctx, gl, projectId)
+      if (result.ok) return { content: result.content, method: 'gitlab-mr', notes }
+      break
+    }
+
+    case 'repo': {
+      notes.push(`Fetched repository via GitLab API`)
+      const result = await renderGitLabRepo(ctx, gl)
+      if (result.ok) return { content: result.content, method: 'gitlab-repo', notes }
+      break
+    }
+  }
+
+  return null
+}
